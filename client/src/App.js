@@ -131,20 +131,33 @@ const getTimeRange = (data) => {
 const TimeSeriesChart = ({ data, metric, color, onChartRef, globalTimeRange }) => {
   const chartRef = useRef(null);
   const chartInstance = useRef(null);
+  const [error, setError] = useState(null);
   const unit = getMetricUnit(metric);
 
   useEffect(() => {
-    if (!data || data.length === 0 || !chartRef.current) return;
-
-    if (chartInstance.current) {
-      chartInstance.current.destroy();
+    // Early return if missing required data
+    if (!data || !Array.isArray(data) || data.length === 0) {
+      setError('No data available');
+      return;
     }
 
-    // Log data structure and time range
-    if (data.length > 0) {
+    if (!chartRef.current) {
+      setError('Chart reference not available');
+      return;
+    }
+
+    try {
+      // Cleanup existing chart
+      if (chartInstance.current) {
+        chartInstance.current.destroy();
+        chartInstance.current = null;
+      }
+
+      // Log data structure and time range for debugging
       console.log(`Processing ${metric} chart with ${data.length} data points`);
-      console.log('Time range:', {
-        min: globalTimeRange.min?.toISOString(),
+      if (globalTimeRange?.min) {
+        console.log('Time range:', {
+          min: globalTimeRange.min?.toISOString(),
         max: globalTimeRange.max?.toISOString(),
         dataStart: new Date(data[0].Timestamp)?.toISOString(),
         dataEnd: new Date(data[data.length - 1].Timestamp)?.toISOString()
@@ -275,23 +288,47 @@ const TimeSeriesChart = ({ data, metric, color, onChartRef, globalTimeRange }) =
       }
     });
 
-    onChartRef?.(chartRef.current);
+      // Only call onChartRef if it exists and we have a valid chart reference
+      if (onChartRef && chartRef.current) {
+        onChartRef(chartRef.current);
+      }
 
+      setError(null); // Clear any previous errors
+    } catch (err) {
+      console.error(`Error creating ${metric} chart:`, err);
+      setError(`Failed to create chart: ${err.message}`);
+    }
+
+    // Cleanup function
     return () => {
       if (chartInstance.current) {
-        chartInstance.current.destroy();
-        chartInstance.current = null;
+        try {
+          chartInstance.current.destroy();
+          chartInstance.current = null;
+        } catch (err) {
+          console.error(`Error cleaning up ${metric} chart:`, err);
+        }
       }
     };
-  }, [data, metric, color, onChartRef]);
+  }, [data, metric, color, onChartRef, globalTimeRange]);
 
-  useEffect(() => {
-    if (chartRef.current) {
-      onChartRef(chartRef.current);
-    }
-  }, [onChartRef]);
+  // If there's an error, display it
+  if (error) {
+    return (
+      <div style={{ 
+        padding: '1rem', 
+        color: 'red', 
+        backgroundColor: '#ffebee',
+        borderRadius: '4px',
+        margin: '0.5rem 0'
+      }}>
+        {error}
+      </div>
+    );
+  }
 
-  c
+  // Return the canvas for the chart
+  return <canvas ref={chartRef} />;
 };
 
 const App = () => {
@@ -364,8 +401,7 @@ const App = () => {
   };
 
   // Server configuration
-  const SERVER_PORT = window.location.hostname === 'localhost' ? 5000 : 80;
-  const API_BASE_URL = `http://${window.location.hostname}:${SERVER_PORT}`;
+  const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || 'http://localhost:5000';
 
   const fetchBaseStations = useCallback(async (station) => {
     try {
@@ -384,9 +420,11 @@ const App = () => {
     setError(null);
 
     try {
-      const url = selectedBaseStation
-        ? `${API_BASE_URL}/api/data/${selectedStation}/${selectedBaseStation}/${selectedTimePeriod}`
-        : `${API_BASE_URL}/api/data/${selectedStation}/${selectedTimePeriod}`;
+      if (!selectedStation) {
+        throw new Error('No station selected');
+      }
+
+      const url = `${API_BASE_URL}/api/data/${selectedStation}/${selectedTimePeriod}${selectedBaseStation ? `?baseStation=${encodeURIComponent(selectedBaseStation)}` : ''}`;
       
       const response = await axios.get(url);
       const newData = response.data;

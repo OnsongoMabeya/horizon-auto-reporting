@@ -1,49 +1,79 @@
 const express = require('express');
-const mysql = require('mysql2');
+const mysql = require('mysql2/promise');
 const cors = require('cors');
 const dotenv = require('dotenv');
 
 dotenv.config();
 
 const app = express();
-app.use(cors()); // Enable CORS for all routes
-
-// Increase payload size limit for JSON
-app.use(express.json({limit: '50mb'}));
-app.use(express.urlencoded({limit: '50mb', extended: true}));
-
-const dbPort = process.env.PORT || 3306; // Database port
-const serverPort = process.env.SERVER_PORT || 5000; // Server port // Use fixed port 5000 for the server
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+// Use port 5000 for the web server, 3306 is for MySQL
+const serverPort = process.env.SERVER_PORT || 5000;
+let db;
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
-  res.status(200).json({ status: 'ok' });
+  res.status(200).json({ status: 'ok', dbConnected: !!db });
 });
 
-// MySQL Connection
-const db = mysql.createConnection({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME
-});
+// Initialize MySQL connection pool
+async function initializeDB() {
+  try {
+    const config = {
+      host: process.env.DB_HOST || 'localhost',
+      user: process.env.DB_USER || 'john',
+      password: process.env.DB_PASSWORD || 'password',
+      database: process.env.DB_NAME || 'horiserverlive',
+      port: process.env.DB_PORT || 3306,
+      waitForConnections: true,
+      connectionLimit: 10,
+      queueLimit: 0
+    };
 
-// Connect to MySQL
-db.connect((err) => {
-  if (err) {
-    console.error('Error connecting to MySQL:', err);
-    console.error('Please check your .env file configuration:');
-    console.error('DB_HOST:', process.env.DB_HOST);
-    console.error('DB_USER:', process.env.DB_USER);
-    console.error('DB_NAME:', process.env.DB_NAME);
-    return;
+    console.log('Initializing database with config:', {
+      ...config,
+      password: '****' // Don't log the password
+    });
+
+    // Create the connection pool
+    db = await mysql.createPool(config);
+    
+    // Test connection and check database/tables
+    const [tables] = await db.query('SHOW TABLES');
+    console.log('Successfully connected to MySQL database');
+    console.log('Available tables:', tables);
+
+    // Verify required tables exist
+    const requiredTables = ['node_status_table'];
+    const existingTables = tables.map(row => Object.values(row)[0]);
+    
+    for (const table of requiredTables) {
+      if (!existingTables.includes(table)) {
+        throw new Error(`Required table '${table}' not found in database`);
+      }
+    }
+
+    // Test query on node_status_table
+    const [testRow] = await db.query('SELECT COUNT(*) as count FROM node_status_table');
+    console.log('node_status_table row count:', testRow[0].count);
+  } catch (err) {
+    console.error('Error initializing database:', err);
+    console.error('Database connection failed. Please check your configuration.');
+    console.error('Environment variables:', {
+      DB_HOST: process.env.DB_HOST,
+      DB_USER: process.env.DB_USER,
+      DB_NAME: process.env.DB_NAME,
+      DB_PORT: process.env.DB_PORT
+    });
+    db = null; // Reset db connection if it failed
+    process.exit(1);
   }
-  console.log('Successfully connected to MySQL database');
-});
+}
 
 // API Routes
 app.get('/api/date-range', (req, res) => {
@@ -269,86 +299,219 @@ function getOverallAssessment(stats) {
   }
 }
 
-app.get('/api/data/:nodeName/:baseStation?/:timePeriod', async (req, res) => {
-  const { nodeName, baseStation, timePeriod } = req.params;
-  console.log('API Request:', { nodeName, timePeriod });
+app.get('/api/data/:nodeName/:timePeriod', async (req, res) => {
+  const { nodeName, timePeriod } = req.params;
+  const { baseStation } = req.query;
+  console.log('\n[/api/data] Request:', { nodeName, baseStation, timePeriod });
   
   try {
-    let timeFilter = '';
-    // First get the latest timestamp for the node
-    const getLatestTimestampQuery = `
-      SELECT MAX(time) as latest_time
-      FROM node_status_table
-      WHERE NodeName = ?
-    `;
+    if (!db) {
+      console.error('Database connection not initialized');
+      return res.status(500).json({ error: 'Database connection not available' });
+    }
+    console.log('Database connection status:', !!db);
 
-    const [latestTimeResult] = await db.promise().query(getLatestTimestampQuery, [nodeName]);
-    const latestTime = latestTimeResult[0].latest_time;
-
-    if (!latestTime) {
-      return res.json([]);
+    // First verify the node exists
+    const [nodeCheck] = await db.query('SELECT DISTINCT NodeName FROM node_status_table WHERE NodeName = ?', [nodeName]);
+    if (nodeCheck.length === 0) {
+      return res.status(404).json({ error: `Node '${nodeName}' not found` });
     }
 
-    // Calculate the time threshold based on the latest data point
-    const latestDate = new Date(latestTime);
-    let timeThreshold;
+    // If baseStation is specified, verify it exists for this node
+    if (baseStation) {
+      const [baseStationCheck] = await db.query(
+        'SELECT DISTINCT NodeBaseStationName FROM node_status_table WHERE NodeName = ? AND NodeBaseStationName = ?',
+        [nodeName, baseStation]
+      );
+      if (baseStationCheck.length === 0) {
+        return res.status(404).json({ error: `Base station '${baseStation}' not found for node '${nodeName}'` });
+      }
+    }
+
+    // Calculate time filter based on period
+    let timeFilter;
+    const now = new Date();
+    
     switch (timePeriod) {
+      case '1h':
+        timeFilter = new Date(now - 60 * 60 * 1000);
+        break;
+      case '24h':
+        timeFilter = new Date(now - 24 * 60 * 60 * 1000);
+        break;
       case '7d':
-        timeThreshold = new Date(latestDate.getTime() - 7 * 24 * 60 * 60 * 1000);
+        timeFilter = new Date(now - 7 * 24 * 60 * 60 * 1000);
         break;
       case '30d':
-        timeThreshold = new Date(latestDate.getTime() - 30 * 24 * 60 * 60 * 1000);
+        timeFilter = new Date(now - 30 * 24 * 60 * 60 * 1000);
         break;
-      default: // 24h
-        timeThreshold = new Date(latestDate.getTime() - 24 * 60 * 60 * 1000);
+      default:
+        return res.status(400).json({
+          error: 'Invalid time period. Must be one of: 1h, 24h, 7d, 30d'
+        });
     }
 
-    const dataQuery = `SELECT 
-      id, NodeName, NodeBaseStationName, 
-      DATE_FORMAT(time, '%Y-%m-%d %H:%i:%s') as Timestamp,
-      StatusCommentsStr as Status,
-      Analog1Value as Voltage, Analog2Value as Current, Analog3Value as Power,
-      Digital1Value, Digital1Alarm, Digital2Value, Digital2Alarm
+    timeFilter = timeFilter.toISOString().slice(0, 19).replace('T', ' ');
+    console.log('Time filter:', timeFilter);
+
+    const params = [nodeName];
+    let baseStationFilter = '';
+    
+    if (baseStation) {
+      baseStationFilter = ' AND NodeBaseStationName = ?';
+      params.push(baseStation);
+    }
+
+    const query = `
+      SELECT 
+        NodeName,
+        NodeBaseStationName,
+        time as Timestamp,
+        Analog1Value as 'Forward Power',
+        Analog2Value as 'Reflected Power',
+        Analog3Value as Temperature,
+        Analog4Value as Voltage,
+        Analog5Value as Current,
+        Analog6Value as Power,
+        ROUND(
+          CASE 
+            WHEN Analog1Value > 0 AND Analog2Value > 0
+            THEN (1 + SQRT(Analog2Value/Analog1Value))/(1 - SQRT(Analog2Value/Analog1Value))
+            ELSE 1
+          END
+        , 2) as VSWR,
+        ROUND(
+          CASE 
+            WHEN Analog1Value > 0 AND Analog2Value > 0
+            THEN -20 * LOG10(SQRT(Analog2Value/Analog1Value))
+            ELSE 0
+          END
+        , 2) as 'Return Loss'
       FROM node_status_table
       WHERE NodeName = ?
-      ${baseStation ? 'AND NodeBaseStationName = ?' : ''}
+      ${baseStationFilter}
       AND time >= ?
-      ORDER BY time DESC`;
+      ORDER BY time DESC
+    `;
+
+    console.log('Query:', query);
+
+    console.log('\nData query:', query);
+    console.log('Query params:', params);
+    console.log('Time filter:', timeFilter);
+
+    const [rows] = await db.query(query, params);
     
-    console.log('Executing query with params:', { nodeName, timeThreshold: timeThreshold.toISOString() });
-    const params = baseStation ? [nodeName, baseStation, timeThreshold] : [nodeName, timeThreshold];
-    console.log('Executing query with params:', { nodeName, baseStation, timeThreshold: timeThreshold.toISOString() });
-    const [rows] = await db.promise().query(dataQuery, params);
-    console.log('Query returned', rows.length, 'records');
-    
+    if (rows.length === 0) {
+      return res.status(404).json({
+        error: 'No data found',
+        params: { nodeName, baseStation, timePeriod }
+      });
+    }
+
     res.json(rows);
   } catch (err) {
     console.error('Database error:', err);
-    res.status(500).json({ 
-      error: 'Database error',
-      details: err.message
+    res.status(500).json({
+      error: 'Failed to fetch data',
+      message: err.message
     });
+  }
+});
+
+// ... (rest of the code remains the same)
+
+// Get base stations endpoint
+app.get('/api/base-stations/:nodeName', async (req, res) => {
+  const { nodeName } = req.params;
+  console.log('\n[/api/base-stations] Request:', { nodeName });
+
+  try {
+    if (!db) {
+      console.error('Database connection not initialized');
+      return res.status(500).json({ error: 'Database connection not available' });
+    }
+
+    // First verify the node exists
+    const [nodeCheck] = await db.query(
+      'SELECT DISTINCT NodeName FROM node_status_table WHERE NodeName = ?',
+      [nodeName]
+    );
+
+    if (nodeCheck.length === 0) {
+      return res.status(404).json({ error: `Node '${nodeName}' not found` });
+    }
+
+    // Get base stations for this node
+    const [rows] = await db.query(
+      'SELECT DISTINCT NodeBaseStationName FROM node_status_table WHERE NodeName = ? ORDER BY NodeBaseStationName',
+      [nodeName]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({
+        error: `No base stations found for node '${nodeName}'`
+      });
+    }
+
+    const baseStations = rows.map(row => row.NodeBaseStationName);
+    console.log('Found base stations:', baseStations);
+    res.json(baseStations);
+  } catch (err) {
+    console.error('Error fetching base stations:', err);
+    res.status(500).json({ error: 'Failed to fetch base stations' });
   }
 });
 
 // Error handling middleware
 app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({ error: 'Something went wrong!' });
+  console.error('Global error handler:', err);
+  res.status(500).json({
+    error: 'Something went wrong!',
+    message: err.message
+  });
 });
 
-// Start server with error handling
-function startServer(port) {
-  const server = app.listen(port, () => {
-    console.log(`Server is running on port ${port}`);
-  }).on('error', (err) => {
-    if (err.code === 'EADDRINUSE') {
-      console.log(`Port ${port} is in use, trying port ${port + 1}`);
-      startServer(port + 1);
-    } else {
-      console.error('Server error:', err);
-    }
-  });
+// Start server with error handling and port conflict resolution
+async function startServer() {
+  try {
+    await initializeDB();
+    
+    // Try to start the server
+    const server = app.listen(serverPort)
+      .on('error', async (error) => {
+        if (error.code === 'EADDRINUSE') {
+          console.log(`Port ${serverPort} is busy, trying port ${serverPort + 1}`);
+          // Try the next port
+          const nextServer = app.listen(serverPort + 1)
+            .on('error', (err) => {
+              console.error('Failed to start server on alternate port:', err);
+              process.exit(1);
+            })
+            .on('listening', () => {
+              console.log(`Server running on alternate port ${serverPort + 1}`);
+            });
+        } else {
+          console.error('Failed to start server:', error);
+          process.exit(1);
+        }
+      })
+      .on('listening', () => {
+        console.log(`Server running on port ${serverPort}`);
+      });
+  } catch (error) {
+    console.error('Failed to start server:', error);
+    process.exit(1);
+  }
 }
 
-startServer(serverPort);
+// Handle process termination
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM received. Shutting down gracefully...');
+  if (db) {
+    await db.end();
+  }
+  process.exit(0);
+});
+
+startServer();

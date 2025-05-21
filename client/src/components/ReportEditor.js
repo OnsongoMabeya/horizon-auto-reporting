@@ -7,65 +7,115 @@ import { generatePDF } from '../utils/pdfUtils';
 import StationCard from './StationCard';
 import AnalysisDialog from './AnalysisDialog';
 
+// Constants
+const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || 'http://localhost:5000';
+
 const ReportEditor = ({ groupedStations, stationData }) => {
   const [narrations, setNarrations] = useState({});
   const [generating, setGenerating] = useState(false);
   const [editingStation, setEditingStation] = useState(null);
-  const [chartsLoaded, setChartsLoaded] = useState(false);
+
   const chartRefsLocal = useRef({});
   const containerRef = useRef(null);
   
-  // Memoize station data processing
-  const processedData = React.useMemo(() => {
-    if (!stationData) return {};
-    const processed = Object.entries(stationData).reduce((acc, [station, stationDataObj]) => {
-      // Get the data array from the station data object
-      const data = stationDataObj && Object.values(stationDataObj)[0];
-      if (!data || !Array.isArray(data) || data.length === 0) return acc;
-      
-      acc[station] = {
-        timestamps: data.map(d => new Date(d.Timestamp).toLocaleString()),
-        forwardPower: data.map(d => d['Forward Power'] || 0),
-        reflectedPower: data.map(d => d['Reflected Power'] || 0),
-        temperature: data.map(d => d.Temperature || 0),
-        voltage: data.map(d => d.Voltage || 0),
-        current: data.map(d => d.Current || 0),
-        power: data.map(d => d.Power || 0),
-        // Calculate VSWR from forward and reflected power
-        vswr: data.map(d => {
-          const forward = d['Forward Power'] || 0;
-          const reflected = d['Reflected Power'] || 0;
-          if (forward <= 0) return 1;
-          const sqrtRho = Math.sqrt(reflected / forward);
-          return (1 + sqrtRho) / (1 - sqrtRho);
-        }),
-        // Calculate return loss
-        returnLoss: data.map(d => {
-          const forward = d['Forward Power'] || 0;
-          const reflected = d['Reflected Power'] || 0;
-          if (forward <= 0 || reflected <= 0) return 0;
-          return -20 * Math.log10(Math.sqrt(reflected / forward));
-        })
-      };
-      return acc;
-    }, {});
-    console.log('Processed data with RF metrics:', processed);
-    return processed;
-  }, [stationData]);
-
-
-  // Load saved narrations from localStorage
-  useEffect(() => {
-    const savedNarrations = localStorage.getItem('reportNarrations');
-    if (savedNarrations) {
-      setNarrations(JSON.parse(savedNarrations));
-    }
+  // Helper functions for data processing
+  const calculateVSWR = React.useCallback((forward, reflected) => {
+    if (forward <= 0) return 1;
+    const sqrtRho = Math.sqrt(reflected / forward);
+    return (1 + sqrtRho) / (1 - sqrtRho);
   }, []);
 
-  // Initialize chart refs
+  const calculateReturnLoss = React.useCallback((forward, reflected) => {
+    if (forward <= 0 || reflected <= 0) return 0;
+    return -20 * Math.log10(Math.sqrt(reflected / forward));
+  }, []);
+
+  // Process data in chunks to prevent memory issues
+  const processDataChunk = React.useCallback((data) => {
+    if (!data) {
+      console.warn('No data received');
+      return null;
+    }
+
+    if (!Array.isArray(data)) {
+      console.warn('Invalid data format received - expected array');
+      return null;
+    }
+    
+    if (data.length === 0) {
+      console.warn('Empty data array received');
+      return null;
+    }
+
+    const chunkSize = 100; // Process 100 data points at a time
+    const result = {
+      timestamps: [],
+      forwardPower: [],
+      reflectedPower: [],
+      temperature: [],
+      voltage: [],
+      current: [],
+      power: [],
+      vswr: [],
+      returnLoss: []
+    };
+
+    for (let i = 0; i < data.length; i += chunkSize) {
+      const chunk = data.slice(i, Math.min(i + chunkSize, data.length));
+      chunk.forEach(d => {
+        result.timestamps.push(new Date(d.Timestamp).toLocaleString());
+        const forward = d['Forward Power'] || 0;
+        const reflected = d['Reflected Power'] || 0;
+        
+        result.forwardPower.push(forward);
+        result.reflectedPower.push(reflected);
+        result.temperature.push(d.Temperature || 0);
+        result.voltage.push(d.Voltage || 0);
+        result.current.push(d.Current || 0);
+        result.power.push(d.Power || 0);
+        result.vswr.push(calculateVSWR(forward, reflected));
+        result.returnLoss.push(calculateReturnLoss(forward, reflected));
+      });
+    }
+
+    return result;
+  }, [calculateVSWR, calculateReturnLoss]);
+
+  // Memoize station data processing with progress tracking
+  const processedData = React.useMemo(() => {
+    if (!stationData) {
+      console.debug('No station data available');
+      return {};
+    }
+
+    if (typeof stationData !== 'object') {
+      console.error('Invalid station data format');
+      return {};
+    }
+
+    const processed = {};
+    let processedCount = 0;
+    const totalStations = Object.keys(stationData).length;
+
+    for (const [station, stationDataObj] of Object.entries(stationData)) {
+      const data = stationDataObj && Object.values(stationDataObj)[0];
+      const result = processDataChunk(data);
+      if (result) processed[station] = result;
+
+      processedCount++;
+      const progress = Math.round((processedCount / totalStations) * 100);
+      console.debug(`Processing station data: ${progress}% complete`);
+    }
+
+    console.debug('Completed processing station data');
+    return processed;
+  }, [stationData, processDataChunk]);
+
+  // Initialize chart refs and load saved narrations
   useEffect(() => {
     if (!groupedStations) return;
 
+    // Initialize chart refs
     const newChartRefs = {};
     Object.entries(groupedStations).forEach(([station]) => {
       newChartRefs[station] = {
@@ -81,136 +131,31 @@ const ReportEditor = ({ groupedStations, stationData }) => {
     });
 
     chartRefsLocal.current = newChartRefs;
+
+    // Load saved narrations
+    const savedNarrations = localStorage.getItem('reportNarrations');
+    if (savedNarrations) {
+      const parsedNarrations = JSON.parse(savedNarrations);
+      // Only load narrations for current stations
+      const filteredNarrations = Object.entries(parsedNarrations)
+        .filter(([station]) => groupedStations[station])
+        .reduce((acc, [station, narration]) => {
+          acc[station] = narration;
+          return acc;
+        }, {});
+      setNarrations(filteredNarrations);
+    }
   }, [groupedStations]);
-
-  // Create and update charts
-  useEffect(() => {
-    if (!groupedStations || !stationData || !processedData || !chartRefsLocal.current) {
-      console.log('Missing required data for chart initialization:', {
-        hasGroupedStations: !!groupedStations,
-        hasStationData: !!stationData,
-        hasProcessedData: !!processedData,
-        hasChartRefs: !!chartRefsLocal.current
-      });
-      return;
-    }
-
-    const charts = [];
-    let allChartsCreated = true;
-
-    // Create charts
-    Object.entries(groupedStations).forEach(([station]) => {
-      if (!processedData[station]) {
-        console.log(`Missing processed data for station: ${station}`);
-        allChartsCreated = false;
-        return;
-      }
-
-      const refs = chartRefsLocal.current[station];
-      const data = processedData[station];
-
-      if (refs && data) {
-        // Create charts for each metric
-        const forwardPowerChart = createChart(
-          refs['Forward Power'].current,
-          'Forward Power (W)',
-          data.timestamps,
-          data.forwardPower,
-          'blue'
-        );
-
-        const reflectedPowerChart = createChart(
-          refs['Reflected Power'].current,
-          'Reflected Power (W)',
-          data.timestamps,
-          data.reflectedPower,
-          'red'
-        );
-
-        const vswrChart = createChart(
-          refs['VSWR'].current,
-          'VSWR',
-          data.timestamps,
-          data.vswr,
-          'orange'
-        );
-
-        const returnLossChart = createChart(
-          refs['Return Loss'].current,
-          'Return Loss (dB)',
-          data.timestamps,
-          data.returnLoss,
-          'purple'
-        );
-
-        const temperatureChart = createChart(
-          refs['Temperature'].current,
-          'Temperature (°C)',
-          data.timestamps,
-          data.temperature,
-          'green'
-        );
-
-        const voltageChart = createChart(
-          refs['Voltage'].current,
-          'Voltage (V)',
-          data.timestamps,
-          data.voltage,
-          'brown'
-        );
-
-        const currentChart = createChart(
-          refs['Current'].current,
-          'Current (A)',
-          data.timestamps,
-          data.current,
-          'orange'
-        );
-
-        const powerChart = createChart(
-          refs['Power'].current,
-          'Power (W)',
-          data.timestamps,
-          data.power,
-          'purple'
-        );
-
-        charts.push(
-          forwardPowerChart,
-          reflectedPowerChart,
-          vswrChart,
-          returnLossChart,
-          temperatureChart,
-          voltageChart,
-          currentChart,
-          powerChart
-        );
-      }
-    });
-
-    setChartsLoaded(allChartsCreated);
-
-    // If all charts are created and we have data, generate initial analysis
-    if (allChartsCreated && !generating) {
-      Object.entries(groupedStations).forEach(([station]) => {
-        if (processedData[station] && !narrations[station]) {
-          generateAutoNarration(station);
-        }
-      });
-    }
-
-    // Cleanup function to destroy charts
-    return () => {
-      charts.forEach(chart => {
-        if (chart) chart.destroy();
-      });
-    };
-  }, [groupedStations, stationData, processedData, generating, generateAutoNarration]);
 
   // Generate auto narration for a station
   const generateAutoNarration = useCallback(async (station) => {
     if (!chartRefsLocal.current) {
-      console.log('Chart refs not ready for', station);
+      console.error('Chart refs not ready for', station);
+      return;
+    }
+
+    if (generating) {
+      console.log('Already generating analysis for another station');
       return;
     }
 
@@ -219,8 +164,7 @@ const ReportEditor = ({ groupedStations, stationData }) => {
     try {
       const data = processedData[station];
       if (!data) {
-        console.error('No processed data available for station:', station);
-        return;
+        throw new Error(`No processed data available for station: ${station}`);
       }
 
       // Calculate insights
@@ -300,10 +244,111 @@ const ReportEditor = ({ groupedStations, stationData }) => {
 
     } catch (error) {
       console.error('Error generating narration:', error);
+      throw error; // Re-throw to be handled by caller
     } finally {
       setGenerating(false);
     }
-  }, [processedData]);
+  }, [processedData, generating]);
+
+  // Memoized chart metrics configuration
+  const chartMetrics = React.useMemo(() => [
+    { name: 'Forward Power', unit: 'W', color: 'blue' },
+    { name: 'Reflected Power', unit: 'W', color: 'red' },
+    { name: 'VSWR', unit: '', color: 'orange' },
+    { name: 'Return Loss', unit: 'dB', color: 'purple' },
+    { name: 'Temperature', unit: '°C', color: 'green' },
+    { name: 'Voltage', unit: 'V', color: 'brown' },
+    { name: 'Current', unit: 'A', color: 'orange' },
+    { name: 'Power', unit: 'W', color: 'purple' }
+  ], []);
+
+  // Create and update charts
+  useEffect(() => {
+    if (!groupedStations || !stationData || !processedData || !chartRefsLocal.current) {
+      console.error('Missing required data for chart initialization:', {
+        hasGroupedStations: !!groupedStations,
+        hasStationData: !!stationData,
+        hasProcessedData: !!processedData,
+        hasChartRefs: !!chartRefsLocal.current
+      });
+      return;
+    }
+
+    const charts = [];
+    const pendingNarrations = [];
+
+    // Create charts with error boundary
+    const createMetricChart = (refs, data, metric, unit, color) => {
+      if (!refs?.[metric]?.current) {
+        console.error(`Missing chart ref for ${metric}`);
+        return false;
+      }
+
+      try {
+        const chart = createChart(
+          refs[metric],
+          `${metric} (${unit})`,
+          data.timestamps,
+          data[metric.toLowerCase().replace(' ', '')],
+          color
+        );
+        charts.push(chart);
+        return true;
+      } catch (error) {
+        console.error(`Error creating chart for ${metric}:`, error);
+        return false;
+      }
+    };
+
+    // Process stations in batches to prevent memory issues
+    const batchSize = 5;
+    const stations = Object.keys(groupedStations);
+    
+    for (let i = 0; i < stations.length; i += batchSize) {
+      const batch = stations.slice(i, i + batchSize);
+      
+      batch.forEach(station => {
+        const refs = chartRefsLocal.current[station];
+        const data = processedData[station];
+
+        if (!data) {
+          console.error(`Missing processed data for station: ${station}`);
+          return;
+        }
+
+        if (refs && data) {
+          const allChartsCreated = chartMetrics.every(metric =>
+            createMetricChart(refs, data, metric.name, metric.unit, metric.color)
+          );
+
+          // Queue narration generation if charts are created and no narration exists
+          if (allChartsCreated && !narrations[station]) {
+            pendingNarrations.push(station);
+          }
+        }
+      });
+    }
+
+    // Generate narrations for all stations that need them
+    if (pendingNarrations.length > 0 && !generating) {
+      (async () => {
+        for (const station of pendingNarrations) {
+          try {
+            await generateAutoNarration(station);
+          } catch (error) {
+            console.error(`Failed to generate narration for ${station}:`, error);
+          }
+        }
+      })();
+    }
+
+    // Cleanup function to destroy charts
+    return () => {
+      charts.forEach(chart => {
+        if (chart?.destroy) chart.destroy();
+      });
+    };
+  }, [groupedStations, stationData, processedData, generating, narrations, generateAutoNarration, chartMetrics]);
 
   // Save narrations to localStorage when they change
   useEffect(() => {
@@ -325,204 +370,153 @@ const ReportEditor = ({ groupedStations, stationData }) => {
     }));
   };
 
-  const generateAutoNarrations = async () => {
-    setGenerating(true);
-    try {
-      const newNarrations = {};
-      
-      Object.entries(groupedStations).forEach(([, baseStations]) => {
-        baseStations.forEach(baseStation => {
-          const data = processedData[baseStation];
-          if (!data) return;
+  // Error state management
+  const [error, setError] = useState(null);
 
-          // Get insights for each metric
-          const forwardPowerInsights = getMetricInsights(data.forwardPower, data.timestamps);
-          const reflectedPowerInsights = getMetricInsights(data.reflectedPower, data.timestamps);
-          const vswrInsights = getMetricInsights(data.vswr, data.timestamps);
-          const returnLossInsights = getMetricInsights(data.returnLoss, data.timestamps);
-          const temperatureInsights = getMetricInsights(data.temperature, data.timestamps);
-          const voltageInsights = getMetricInsights(data.voltage, data.timestamps);
-          const currentInsights = getMetricInsights(data.current, data.timestamps);
-          const powerInsights = getMetricInsights(data.power, data.timestamps);
-
-          // Initialize chart images
-          const chartImages = {};
-          
-          // Capture chart images
-          try {
-            if (chartRefsLocal.current?.[baseStation]) {
-              const refs = chartRefsLocal.current[baseStation];
-              Object.assign(chartImages, {
-                forwardPowerImage: refs['Forward Power'].current?.toDataURL() || '',
-                reflectedPowerImage: refs['Reflected Power'].current?.toDataURL() || '',
-                vswrImage: refs['VSWR'].current?.toDataURL() || '',
-                returnLossImage: refs['Return Loss'].current?.toDataURL() || '',
-                temperatureImage: refs['Temperature'].current?.toDataURL() || '',
-                voltageImage: refs['Voltage'].current?.toDataURL() || '',
-                currentImage: refs['Current'].current?.toDataURL() || '',
-                powerImage: refs['Power'].current?.toDataURL() || ''
-              });
-            }
-          } catch (err) {
-            console.error('Error capturing chart images:', err);
-            // Set default empty values if image capture fails
-            Object.assign(chartImages, {
-              forwardPowerImage: '',
-              reflectedPowerImage: '',
-              vswrImage: '',
-              returnLossImage: '',
-              temperatureImage: '',
-              voltageImage: '',
-              currentImage: '',
-              powerImage: ''
-            });
-          }
-
-          // Generate analysis text
-          newNarrations[baseStation] = `
-            <div class="rf-analysis">
-              <h4>RF System Analysis for ${baseStation}</h4>
-              
-              <div class="analysis-section">
-                <h4>Forward Power Analysis:</h4>
-                <img src="${chartImages.forwardPowerImage}" alt="Forward Power Chart" style="width: 100%; margin-bottom: 15px;" />
-                <p>Maximum: ${forwardPowerInsights.max.toFixed(2)}W at ${forwardPowerInsights.maxTime}</p>
-                <p>Minimum: ${forwardPowerInsights.min.toFixed(2)}W at ${forwardPowerInsights.minTime}</p>
-                <p>Average: ${forwardPowerInsights.average.toFixed(2)}W</p>
-                <p>Trend: ${forwardPowerInsights.trend}</p>
-              </div>
-
-              <div class="analysis-section">
-                <h4>Reflected Power Analysis:</h4>
-                <img src="${chartImages.reflectedPowerImage}" alt="Reflected Power Chart" style="width: 100%; margin-bottom: 15px;" />
-                <p>Maximum: ${reflectedPowerInsights.max.toFixed(2)}W at ${reflectedPowerInsights.maxTime}</p>
-                <p>Minimum: ${reflectedPowerInsights.min.toFixed(2)}W at ${reflectedPowerInsights.minTime}</p>
-                <p>Average: ${reflectedPowerInsights.average.toFixed(2)}W</p>
-                <p>Trend: ${reflectedPowerInsights.trend}</p>
-              </div>
-
-              <div class="analysis-section">
-                <h4>VSWR Analysis:</h4>
-                <img src="${chartImages.vswrImage}" alt="VSWR Chart" style="width: 100%; margin-bottom: 15px;" />
-                <p>Maximum: ${vswrInsights.max.toFixed(2)} at ${vswrInsights.maxTime}</p>
-                <p>Minimum: ${vswrInsights.min.toFixed(2)} at ${vswrInsights.minTime}</p>
-                <p>Average: ${vswrInsights.average.toFixed(2)}</p>
-                <p>Trend: ${vswrInsights.trend}</p>
-              </div>
-
-              <div class="analysis-section">
-                <h4>Return Loss Analysis:</h4>
-                <img src="${chartImages.returnLossImage}" alt="Return Loss Chart" style="width: 100%; margin-bottom: 15px;" />
-                <p>Maximum: ${returnLossInsights.max.toFixed(2)}dB at ${returnLossInsights.maxTime}</p>
-                <p>Minimum: ${returnLossInsights.min.toFixed(2)}dB at ${returnLossInsights.minTime}</p>
-                <p>Average: ${returnLossInsights.average.toFixed(2)}dB</p>
-                <p>Trend: ${returnLossInsights.trend}</p>
-              </div>
-
-              <div class="analysis-section">
-                <h4>Temperature Analysis:</h4>
-                <img src="${chartImages.temperatureImage}" alt="Temperature Chart" style="width: 100%; margin-bottom: 15px;" />
-                <p>Maximum: ${temperatureInsights.max.toFixed(2)}°C at ${temperatureInsights.maxTime}</p>
-                <p>Minimum: ${temperatureInsights.min.toFixed(2)}°C at ${temperatureInsights.minTime}</p>
-                <p>Average: ${temperatureInsights.average.toFixed(2)}°C</p>
-                <p>Trend: ${temperatureInsights.trend}</p>
-              </div>
-
-              <div class="analysis-section">
-                <h4>Voltage Analysis:</h4>
-                <img src="${chartImages.voltageImage}" alt="Voltage Chart" style="width: 100%; margin-bottom: 15px;" />
-                <p>Maximum: ${voltageInsights.max.toFixed(2)}V at ${voltageInsights.maxTime}</p>
-                <p>Minimum: ${voltageInsights.min.toFixed(2)}V at ${voltageInsights.minTime}</p>
-                <p>Average: ${voltageInsights.average.toFixed(2)}V</p>
-                <p>Trend: ${voltageInsights.trend}</p>
-              </div>
-
-              <div class="analysis-section">
-                <h4>Current Analysis:</h4>
-                <img src="${chartImages.currentImage}" alt="Current Chart" style="width: 100%; margin-bottom: 15px;" />
-                <p>Maximum: ${currentInsights.max.toFixed(2)}A at ${currentInsights.maxTime}</p>
-                <p>Minimum: ${currentInsights.min.toFixed(2)}A at ${currentInsights.minTime}</p>
-                <p>Average: ${currentInsights.average.toFixed(2)}A</p>
-                <p>Trend: ${currentInsights.trend}</p>
-              </div>
-
-              <div class="analysis-section">
-                <h4>Power Analysis:</h4>
-                <img src="${chartImages.powerImage}" alt="Power Chart" style="width: 100%; margin-bottom: 15px;" />
-                <p>Maximum: ${powerInsights.max.toFixed(2)}W at ${powerInsights.maxTime}</p>
-                <p>Minimum: ${powerInsights.min.toFixed(2)}W at ${powerInsights.minTime}</p>
-                <p>Average: ${powerInsights.average.toFixed(2)}W</p>
-                <p>Trend: ${powerInsights.trend}</p>
-              </div>
-
-              <div class="health-assessment">
-                <h4>System Health Assessment:</h4>
-                <p>${vswrInsights.average > 1.5 ? '⚠️ High VSWR detected. Check antenna system.' : '✅ VSWR within acceptable range.'}</p>
-                <p>${returnLossInsights.average < -20 ? '✅ Good impedance matching.' : '⚠️ Poor return loss. Check RF system.'}</p>
-                <p>${temperatureInsights.max > 50 ? '⚠️ High temperature detected. Check cooling system.' : '✅ Temperature within normal range.'}</p>
-              </div>
-            </div>
-          `;
-        });
-      });
-
-      setNarrations(newNarrations);
-    } catch (error) {
-      console.error('Error generating narrations:', error);
-    } finally {
-      setGenerating(false);
+  // Clear error after 5 seconds
+  useEffect(() => {
+    if (error) {
+      const timer = setTimeout(() => setError(null), 5000);
+      return () => clearTimeout(timer);
     }
-  };
+  }, [error]);
+
+  const handleError = useCallback((error, context) => {
+    console.error(`Error in ${context}:`, error);
+    setError({
+      context,
+      message: error.message || 'An unexpected error occurred',
+      timestamp: new Date().toISOString()
+    });
+  }, []);
 
   const handleGeneratePDF = async () => {
+    if (generating) {
+      handleError(new Error('Already generating a report'), 'PDF Generation');
+      return;
+    }
+
     setGenerating(true);
     try {
+      if (!containerRef.current) {
+        throw new Error('Container reference not available');
+      }
+
       const pdf = await generatePDF(containerRef, narrations, chartRefsLocal.current);
-      pdf.save(`horizon_auto_report_${new Date().toISOString().split('T')[0]}.pdf`);
+      const filename = `horizon_auto_report_${new Date().toISOString().split('T')[0]}.pdf`;
+      
+      try {
+        await pdf.save(filename);
+      } catch (saveError) {
+        throw new Error(`Failed to save PDF: ${saveError.message}`);
+      }
     } catch (error) {
-      console.error('Error generating PDF:', error);
+      handleError(error, 'PDF Generation');
     } finally {
       setGenerating(false);
     }
   };
 
+  // Memoize sorted and filtered stations for better performance
+  const sortedStations = React.useMemo(() => {
+    if (!groupedStations) return [];
+    return Object.entries(groupedStations)
+      .filter(([station]) => processedData[station])
+      .sort(([a], [b]) => a.localeCompare(b));
+  }, [groupedStations, processedData]);
+
   return (
-    <Box sx={{ mt: 4 }} ref={containerRef}>
-      <Box sx={{ mb: 3, display: 'flex', gap: 2 }}>
+    <Box ref={containerRef}>
+      <Box sx={{
+        mb: 3,
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        flexWrap: 'wrap',
+        gap: 2
+      }}>
+        <Typography variant="h4">
+          Station Reports
+        </Typography>
+
         <Button
-          variant="contained"
-          color="primary"
-          onClick={handleGeneratePDF}
           startIcon={<PictureAsPdf />}
-          disabled={!chartsLoaded}
+          variant="contained"
+          onClick={handleGeneratePDF}
+          disabled={generating}
         >
-          GENERATE COMBINED PDF REPORT
+          {generating ? (
+            <>
+              <CircularProgress size={24} sx={{ mr: 1 }} />
+              Generating PDF...
+            </>
+          ) : (
+            'Generate PDF Report'
+          )}
         </Button>
       </Box>
 
-      {Object.entries(groupedStations).map(([station, baseStations]) => (
-        <Box key={station} sx={{ mb: 4 }}>
-          <Typography variant="h5" gutterBottom>{station}</Typography>
-          {baseStations.map(baseStation => (
-            <StationCard
-              key={baseStation}
-              baseStation={baseStation}
-              narration={narrations[station] || ''}
-              onEditClick={() => setEditingStation(station)}
-              onGenerateAnalysis={() => generateAutoNarration(station)}
-              isGenerating={generating}
-              chartRefs={chartRefsLocal.current[station]}
-            />
-          ))}
+      {/* Error Alert */}
+      {error && (
+        <Box
+          sx={{
+            mb: 2,
+            p: 2,
+            borderRadius: 1,
+            bgcolor: 'error.light',
+            color: 'error.contrastText',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between'
+          }}
+        >
+          <Typography>
+            {error.context}: {error.message}
+          </Typography>
+          <Button
+            size="small"
+            sx={{ color: 'inherit' }}
+            onClick={() => setError(null)}
+          >
+            Dismiss
+          </Button>
         </Box>
-      ))}
+      )}
+
+      {/* Station Cards with virtualization for better performance */}
+      <Box sx={{ 
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 2,
+        height: '100%',
+        overflow: 'auto'
+      }}>
+        {sortedStations.map(([station]) => (
+          <StationCard
+            key={station}
+            baseStation={station}
+            narration={narrations[station]}
+            onEditClick={() => setEditingStation(station)}
+            onGenerateAnalysis={() => generateAutoNarration(station)}
+            isGenerating={generating && editingStation === station}
+            chartRefs={chartRefsLocal.current[station]}
+            error={error?.context === station ? error.message : null}
+          />
+        ))}
+
+        {sortedStations.length === 0 && (
+          <Typography variant="body1" sx={{ textAlign: 'center', py: 4 }}>
+            No stations available. Please check your data and try again.
+          </Typography>
+        )}
+      </Box>
 
       <AnalysisDialog
         open={!!editingStation}
-        station={editingStation}
-        content={editingStation ? narrations[editingStation] : ''}
         onClose={() => setEditingStation(null)}
-        onChange={(content) => handleNarrationChange(editingStation, content)}
+        station={editingStation}
+        narration={editingStation ? narrations[editingStation] : ''}
+        onNarrationChange={handleNarrationChange}
       />
     </Box>
   );
