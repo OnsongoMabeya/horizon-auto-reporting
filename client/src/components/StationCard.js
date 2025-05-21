@@ -11,43 +11,33 @@ const StationCard = React.memo(({
   baseStation,
   narration,
   onEditClick,
+  onGenerateAnalysis,
+  isGenerating,
   chartRefs
 }) => {
   return (
     <Paper sx={{ p: 3, mb: 3 }}>
       <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
         <Typography variant="h6">{baseStation}</Typography>
-        <Button
-          startIcon={<Edit />}
-          onClick={onEditClick}
-          size="small"
-        >
-          EDIT NARRATION
-        </Button>
+        <Box sx={{ display: 'flex', gap: 2 }}>
+          <Button
+            onClick={onGenerateAnalysis}
+            size="small"
+            variant="contained"
+            color="primary"
+            disabled={isGenerating}
+          >
+            {isGenerating ? 'GENERATING...' : 'GENERATE AUTO ANALYSIS'}
+          </Button>
+          <Button
+            startIcon={<Edit />}
+            onClick={onEditClick}
+            size="small"
+          >
+            EDIT NARRATION
+          </Button>
+        </Box>
       </Box>
-
-      {/* <Stack spacing={3} sx={{ mb: 3 }}>
-        {chartRefs[baseStation] && [
-          { metric: 'Voltage', label: 'Voltage Readings', color: 'rgb(33, 150, 243)' },
-          { metric: 'Current', label: 'Current Readings', color: 'rgb(244, 67, 54)' },
-          { metric: 'Power', label: 'Power Readings', color: 'rgb(76, 175, 80)' }
-        ].map(({ metric, label, color }) => (
-          <Box key={metric}>
-            <Typography variant="h6" gutterBottom sx={{ color: color }}>
-              {label}
-            </Typography>
-            <Box sx={{
-              height: 300,
-              p: 2,
-              bgcolor: 'background.paper',
-              borderRadius: 1,
-              boxShadow: '0 1px 3px rgba(0,0,0,0.12)'
-            }}>
-              <canvas ref={chartRefs[baseStation][metric]} style={{ width: '100%', height: '100%' }} />
-            </Box>
-          </Box>
-        ))}
-      </Stack> */}
 
       <Box sx={{ mt: 3, p: 2, bgcolor: 'background.paper', borderRadius: 1 }}>
         <Typography variant="h6" gutterBottom>Analysis</Typography>

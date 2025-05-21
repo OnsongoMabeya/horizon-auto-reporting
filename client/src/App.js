@@ -32,7 +32,7 @@ import {
   Chip
 } from '@mui/material';
 import { TabContext, TabList, TabPanel } from '@mui/lab';
-import { ReportEditor } from './components/ReportEditor';
+import ReportEditor from './components/ReportEditor';
 
 // Constants
 const NODE_NAMES = ['Aviation FM', 'Emoo FM', 'Genset02', 'Kameme FM', 'MediaMax1'];
@@ -92,75 +92,190 @@ const calculateStats = (data, metric) => {
   return { avg, max, min };
 };
 
+const getMetricUnit = (metric) => {
+  switch (metric) {
+    case 'Forward Power':
+    case 'Reflected Power':
+    case 'Power':
+      return 'W';
+    case 'VSWR':
+      return 'ratio';
+    case 'Return Loss':
+      return 'dB';
+    case 'Temperature':
+      return '°C';
+    case 'Voltage':
+      return 'V';
+    case 'Current':
+      return 'A';
+    default:
+      return '';
+  }
+};
+
 // Components
-const TimeSeriesChart = ({ data, metric, color, onChartRef }) => {
+// Get global time range for all charts
+const getTimeRange = (data) => {
+  if (!data || data.length === 0) return { min: undefined, max: undefined };
+  
+  const timestamps = data
+    .filter(d => d && d.Timestamp)
+    .map(d => new Date(d.Timestamp).getTime());
+
+  return {
+    min: new Date(Math.min(...timestamps)),
+    max: new Date(Math.max(...timestamps))
+  };
+};
+
+const TimeSeriesChart = ({ data, metric, color, onChartRef, globalTimeRange }) => {
   const chartRef = useRef(null);
   const chartInstance = useRef(null);
+  const unit = getMetricUnit(metric);
 
   useEffect(() => {
     if (!data || data.length === 0 || !chartRef.current) return;
 
-    // Always destroy the previous chart instance before creating a new one
     if (chartInstance.current) {
       chartInstance.current.destroy();
-      chartInstance.current = null;
     }
 
+    // Log data structure and time range
+    if (data.length > 0) {
+      console.log(`Processing ${metric} chart with ${data.length} data points`);
+      console.log('Time range:', {
+        min: globalTimeRange.min?.toISOString(),
+        max: globalTimeRange.max?.toISOString(),
+        dataStart: new Date(data[0].Timestamp)?.toISOString(),
+        dataEnd: new Date(data[data.length - 1].Timestamp)?.toISOString()
+      });
+    }
+
+    // Map metric names to data fields
+    const metricToField = {
+      'Forward Power': 'ForwardPower',
+      'Reflected Power': 'ReflectedPower',
+      'VSWR': 'VSWR',
+      'Return Loss': 'ReturnLoss',
+      'Temperature': 'Temperature',
+      'Voltage': 'Voltage',
+      'Current': 'Current',
+      'Power': 'Power'
+    };
+
+    const field = metricToField[metric];
+    
+    // Filter data within the global time range
+    const processedData = data
+      .filter(d => {
+        const timestamp = new Date(d.Timestamp);
+        return d && 
+               timestamp && 
+               d[field] !== undefined && 
+               d[field] !== null &&
+               timestamp >= globalTimeRange.min &&
+               timestamp <= globalTimeRange.max;
+      })
+      .map(d => ({
+        x: new Date(d.Timestamp),
+        y: parseFloat(d[field])
+      }))
+      .sort((a, b) => a.x - b.x);
+
+    // Calculate min/max for better scaling
+    const values = processedData.map(d => d.y);
+    const minValue = Math.min(...values);
+    const maxValue = Math.max(...values);
+    const range = maxValue - minValue;
+
+    // Set scale padding based on data range
+    const padding = range * 0.1; // 10% padding
+
     const ctx = chartRef.current.getContext('2d');
-
-    const chartData = data.map(item => ({
-      x: new Date(item.Timestamp),
-      y: Number(item[metric])
-    }));
-
-    // Sort data by timestamp
-    chartData.sort((a, b) => a.x - b.x);
-
-    const newChart = new Chart(ctx, {
+    chartInstance.current = new Chart(ctx, {
       type: 'line',
       data: {
         datasets: [{
-          label: metric,
-          data: chartData,
+          label: `${metric} (${unit})`,
+          data: processedData,
           borderColor: color,
-          backgroundColor: color + '40',
-          fill: true,
-          tension: 0.4
+          backgroundColor: color + '20',
+          borderWidth: 2,
+          pointRadius: 1,
+          pointHoverRadius: 5,
+          tension: 0.4,
+          fill: true
         }]
       },
       options: {
         responsive: true,
         maintainAspectRatio: false,
+        animation: false,
+        plugins: {
+          legend: {
+            display: false
+          },
+          title: {
+            display: true,
+            text: `${metric} (${unit})`,
+            font: {
+              size: 16,
+              weight: 'bold'
+            },
+            color: color
+          },
+          tooltip: {
+            mode: 'index',
+            intersect: false,
+            callbacks: {
+              label: (context) => `${metric}: ${context.parsed.y.toFixed(2)} ${unit}`
+            }
+          }
+        },
         scales: {
           x: {
             type: 'time',
-            time: { unit: 'hour' },
-            title: { display: true, text: 'Time' },
+            time: {
+              unit: 'hour',
+              displayFormats: {
+                hour: 'HH:mm',
+                day: 'MMM D'
+              },
+              min: globalTimeRange.min,
+              max: globalTimeRange.max,
+              bounds: 'data'
+            },
             adapters: {
               date: {
                 locale: enUS
               }
+            },
+            grid: {
+              color: 'rgba(0,0,0,0.1)'
+            },
+            title: {
+              display: true,
+              text: 'Time'
             }
           },
           y: {
-            title: { display: true, text: metric },
-            beginAtZero: true
+            beginAtZero: metric === 'VSWR' || metric === 'Return Loss',
+            suggestedMin: Math.max(0, minValue - padding),
+            suggestedMax: maxValue + padding,
+            grid: {
+              color: 'rgba(0,0,0,0.1)'
+            },
+            title: {
+              display: true,
+              text: `${metric} (${unit})`,
+              color: color
+            }
           }
-        },
-        plugins: {
-          legend: { display: false },
-          tooltip: { mode: 'index', intersect: false }
-        },
-        interaction: { intersect: false, mode: 'index' }
+        }
       }
     });
 
-    chartInstance.current = newChart;
-    
-    // Pass the canvas element to parent
-    if (onChartRef) {
-      onChartRef(chartRef.current);
-    }
+    onChartRef?.(chartRef.current);
 
     return () => {
       if (chartInstance.current) {
@@ -176,32 +291,64 @@ const TimeSeriesChart = ({ data, metric, color, onChartRef }) => {
     }
   }, [onChartRef]);
 
-  return (
-    <Card elevation={3} sx={{ height: '100%', p: 2 }}>
-      <CardContent>
-        <Typography variant="h6" gutterBottom color="primary">
-          {metric} Readings
-        </Typography>
-        <div style={{ height: '300px', width: '100%' }}>
-          <canvas ref={chartRef} />
-        </div>
-      </CardContent>
-    </Card>
-  );
+  c
 };
 
 const App = () => {
   const chartRefs = useRef({});
   const [selectedStation, setSelectedStation] = useState(NODE_NAMES[0]);
-  const [baseStations, setBaseStations] = useState([]);
   const [selectedBaseStation, setSelectedBaseStation] = useState('');
-  const [selectedTimePeriod, setSelectedTimePeriod] = useState(TIME_PERIODS[0].value);
-  const [data, setData] = useState([]);
+  const [selectedTimePeriod, setSelectedTimePeriod] = useState('24h');
+  const [baseStations, setBaseStations] = useState([]);
+  const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [selectedTab, setSelectedTab] = useState('1');
   const [page, setPage] = useState(0);
   const [rowsPerPage, setRowsPerPage] = useState(10);
+  
+  // Chart refs for synchronizing zoom/pan
+  const forwardPowerChartRef = useRef(null);
+  const reflectedPowerChartRef = useRef(null);
+  const vswrChartRef = useRef(null);
+  const returnLossChartRef = useRef(null);
+  const temperatureChartRef = useRef(null);
+  const voltageChartRef = useRef(null);
+  const currentChartRef = useRef(null);
+  const powerChartRef = useRef(null);
+  const [timeRange, setTimeRange] = useState({ min: null, max: null });
+
+  const handleForwardPowerChartRef = useCallback((chart) => {
+    forwardPowerChartRef.current = chart;
+  }, []);
+
+  const handleReflectedPowerChartRef = useCallback((chart) => {
+    reflectedPowerChartRef.current = chart;
+  }, []);
+
+  const handleVSWRChartRef = useCallback((chart) => {
+    vswrChartRef.current = chart;
+  }, []);
+
+  const handleReturnLossChartRef = useCallback((chart) => {
+    returnLossChartRef.current = chart;
+  }, []);
+
+  const handleTemperatureChartRef = useCallback((chart) => {
+    temperatureChartRef.current = chart;
+  }, []);
+
+  const handleVoltageChartRef = useCallback((chart) => {
+    voltageChartRef.current = chart;
+  }, []);
+
+  const handleCurrentChartRef = useCallback((chart) => {
+    currentChartRef.current = chart;
+  }, []);
+
+  const handlePowerChartRef = useCallback((chart) => {
+    powerChartRef.current = chart;
+  }, []);
 
   const handleTabChange = (event, newValue) => {
     setSelectedTab(newValue);
@@ -242,7 +389,25 @@ const App = () => {
         : `${API_BASE_URL}/api/data/${selectedStation}/${selectedTimePeriod}`;
       
       const response = await axios.get(url);
-      setData(response.data);
+      const newData = response.data;
+      
+      // Calculate global time range from the new data
+      if (newData && newData.length > 0) {
+        // Sort data by timestamp first
+        newData.sort((a, b) => new Date(a.Timestamp) - new Date(b.Timestamp));
+        
+        // Filter out invalid timestamps and get min/max
+        const validData = newData.filter(d => d && d.Timestamp);
+        if (validData.length > 0) {
+          const min = new Date(validData[0].Timestamp);
+          const max = new Date(validData[validData.length - 1].Timestamp);
+          
+          console.log('New time range:', { min, max });
+          setTimeRange({ min, max });
+        }
+      }
+
+      setData(newData);
     } catch (err) {
       setError('Failed to fetch data. Please try again later.');
       console.error('Error fetching data:', err);
@@ -259,29 +424,58 @@ const App = () => {
     fetchData();
   }, [fetchData]);
 
+  useEffect(() => {
+    fetchData();
+  }, [fetchData, selectedStation, selectedBaseStation, selectedTimePeriod]);
+
+  useEffect(() => {
+    fetchBaseStations(selectedStation);
+  }, [fetchBaseStations, selectedStation]);
+
+  useEffect(() => {
+    if (selectedStation && selectedBaseStation) {
+      chartRefs.current[selectedStation] = {
+        'Forward Power': forwardPowerChartRef,
+        'Reflected Power': reflectedPowerChartRef,
+        'VSWR': vswrChartRef,
+        'Return Loss': returnLossChartRef,
+        'Temperature': temperatureChartRef,
+        'Voltage': voltageChartRef,
+        'Current': currentChartRef,
+        'Power': powerChartRef
+      };
+    }
+  }, [selectedStation, selectedBaseStation]);
+
   const handleStationChange = (event) => {
     setSelectedStation(event.target.value);
+  };
+
+  const handleBaseStationChange = (event) => {
+    setSelectedBaseStation(event.target.value);
   };
 
   const handleTimePeriodChange = (event) => {
     setSelectedTimePeriod(event.target.value);
   };
 
-  // Loading state
-  if (loading) {
+  if (loading && !data) {
     return (
-      <Container maxWidth="lg" sx={{ mt: 4, display: 'flex', justifyContent: 'center' }}>
+      <Box display="flex" justifyContent="center" alignItems="center" minHeight="100vh">
         <CircularProgress />
-      </Container>
+      </Box>
     );
   }
 
-  // Error state
   if (error) {
     return (
-      <Container maxWidth="lg" sx={{ mt: 4 }}>
-        <Alert severity="error">{error}</Alert>
-      </Container>
+      <ThemeProvider theme={theme}>
+        <Box sx={{ flexGrow: 1 }}>
+          <Container maxWidth="lg" sx={{ mt: 4 }}>
+            <Alert severity="error">{error}</Alert>
+          </Container>
+        </Box>
+      </ThemeProvider>
     );
   }
 
@@ -312,47 +506,29 @@ const App = () => {
                   labelId="station-select-label"
                   id="station-select"
                   value={selectedStation}
-                  label="Station"
                   onChange={handleStationChange}
                 >
-                  {NODE_NAMES.map((station) => (
-                    <MenuItem key={station} value={station}>
-                      {station}
-                    </MenuItem>
+                  {NODE_NAMES.map((name) => (
+                    <MenuItem key={name} value={name}>{name}</MenuItem>
                   ))}
                 </Select>
               </FormControl>
             </Grid>
-
-            <Grid item xs={12} sm={6} md={4}>
+            <Grid item xs={12}>
               <FormControl fullWidth>
-                <InputLabel id="base-station-select-label">Base Station</InputLabel>
-                <Select
-                  labelId="base-station-select-label"
-                  id="base-station-select"
-                  value={selectedBaseStation}
-                  label="Base Station"
-                  onChange={(e) => setSelectedBaseStation(e.target.value)}
-                >
-                  {baseStations.map((station) => (
-                    <MenuItem key={station} value={station}>
-                      {station}
-                    </MenuItem>
+                <InputLabel>Base Station</InputLabel>
+                <Select value={selectedBaseStation} onChange={handleBaseStationChange}>
+                  <MenuItem value="">All Base Stations</MenuItem>
+                  {baseStations.map((name) => (
+                    <MenuItem key={name} value={name}>{name}</MenuItem>
                   ))}
                 </Select>
               </FormControl>
             </Grid>
-
-            <Grid item xs={12} sm={6} md={4}>
+            <Grid item xs={12}>
               <FormControl fullWidth>
-                <InputLabel id="time-period-select-label">Time Period</InputLabel>
-                <Select
-                  labelId="time-period-select-label"
-                  id="time-period-select"
-                  value={selectedTimePeriod}
-                  label="Time Period"
-                  onChange={handleTimePeriodChange}
-                >
+                <InputLabel>Time Period</InputLabel>
+                <Select value={selectedTimePeriod} onChange={handleTimePeriodChange}>
                   {TIME_PERIODS.map((period) => (
                     <MenuItem key={period.value} value={period.value}>
                       {period.label}
@@ -363,7 +539,6 @@ const App = () => {
             </Grid>
           </Grid>
 
-          {/* Tabs and Content */}
           <TabContext value={selectedTab}>
             <Box sx={{ borderBottom: 1, borderColor: 'divider', mb: 3 }}>
               <TabList onChange={handleTabChange} aria-label="lab API tabs example">
@@ -373,41 +548,80 @@ const App = () => {
             </Box>
 
             <TabPanel value="1">
-              <Stack spacing={3} sx={{ width: '100%' }}>
+              <Grid container spacing={3}>
+              <Grid item xs={12} md={6}>
+                <TimeSeriesChart
+                  data={data}
+                  metric="Forward Power"
+                  color="#2196f3"
+                  globalTimeRange={timeRange}
+                  onChartRef={handleForwardPowerChartRef}
+                />
+              </Grid>
+              <Grid item xs={12} md={6}>
+                <TimeSeriesChart
+                  data={data}
+                  metric="Reflected Power"
+                  color="#f44336"
+                  globalTimeRange={timeRange}
+                  onChartRef={handleReflectedPowerChartRef}
+                />
+              </Grid>
+              <Grid item xs={12} md={6}>
+                <TimeSeriesChart
+                  data={data}
+                  metric="VSWR"
+                  color="#ff9800"
+                  globalTimeRange={timeRange}
+                  onChartRef={handleVSWRChartRef}
+                />
+              </Grid>
+              <Grid item xs={12} md={6}>
+                <TimeSeriesChart
+                  data={data}
+                  metric="Return Loss"
+                  color="#9c27b0"
+                  globalTimeRange={timeRange}
+                  onChartRef={handleReturnLossChartRef}
+                />
+              </Grid>
+              <Grid item xs={12} md={6}>
+                <TimeSeriesChart
+                  data={data}
+                  metric="Temperature"
+                  color="#4caf50"
+                  globalTimeRange={timeRange}
+                  onChartRef={handleTemperatureChartRef}
+                />
+              </Grid>
+              <Grid item xs={12} md={6}>
                 <TimeSeriesChart
                   data={data}
                   metric="Voltage"
-                  color="#2196f3"
-                  onChartRef={(el) => {
-                    if (!chartRefs.current[selectedBaseStation]) {
-                      chartRefs.current[selectedBaseStation] = {};
-                    }
-                    chartRefs.current[selectedBaseStation]['Voltage'] = el;
-                  }}
+                  color="#00bcd4"
+                  globalTimeRange={timeRange}
+                  onChartRef={handleVoltageChartRef}
                 />
+              </Grid>
+              <Grid item xs={12} md={6}>
                 <TimeSeriesChart
                   data={data}
                   metric="Current"
-                  color="#f44336"
-                  onChartRef={(el) => {
-                    if (!chartRefs.current[selectedBaseStation]) {
-                      chartRefs.current[selectedBaseStation] = {};
-                    }
-                    chartRefs.current[selectedBaseStation]['Current'] = el;
-                  }}
+                  color="#ff5722"
+                  globalTimeRange={timeRange}
+                  onChartRef={handleCurrentChartRef}
                 />
+              </Grid>
+              <Grid item xs={12} md={6}>
                 <TimeSeriesChart
                   data={data}
                   metric="Power"
-                  color="#4caf50"
-                  onChartRef={(el) => {
-                    if (!chartRefs.current[selectedBaseStation]) {
-                      chartRefs.current[selectedBaseStation] = {};
-                    }
-                    chartRefs.current[selectedBaseStation]['Power'] = el;
-                  }}
+                  color="#795548"
+                  globalTimeRange={timeRange}
+                  onChartRef={handlePowerChartRef}
                 />
-              </Stack>
+              </Grid>
+              </Grid>
             </TabPanel>
 
             <TabPanel value="2">
@@ -416,39 +630,45 @@ const App = () => {
                   <TableHead>
                     <TableRow>
                       <TableCell>Timestamp</TableCell>
-                      <TableCell align="right">Voltage</TableCell>
-                      <TableCell align="right">Current</TableCell>
-                      <TableCell align="right">Power</TableCell>
+                      <TableCell>Forward Power</TableCell>
+                      <TableCell>Reflected Power</TableCell>
+                      <TableCell>VSWR</TableCell>
+                      <TableCell>Return Loss</TableCell>
+                      <TableCell>Temperature</TableCell>
+                      <TableCell>Voltage</TableCell>
+                      <TableCell>Current</TableCell>
+                      <TableCell>Power</TableCell>
                     </TableRow>
                   </TableHead>
                   <TableBody>
-                    {data
-                      .slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage)
-                      .map((row, index) => (
-                        <TableRow
-                          key={index}
-                          sx={{ '&:last-child td, &:last-child th': { border: 0 } }}
-                        >
-                          <TableCell component="th" scope="row">
-                            {new Date(row.Timestamp).toLocaleString()}
-                          </TableCell>
-                          <TableCell align="right">{row.Voltage}</TableCell>
-                          <TableCell align="right">{row.Current}</TableCell>
-                          <TableCell align="right">{row.Power}</TableCell>
-                        </TableRow>
-                      ))}
+                    {data && (rowsPerPage > 0
+                      ? data.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage)
+                      : data
+                    ).map((row, index) => (
+                      <TableRow key={index}>
+                        <TableCell>{row.Timestamp ? new Date(row.Timestamp).toLocaleString() : ''}</TableCell>
+                        <TableCell>{row['Forward Power']}</TableCell>
+                        <TableCell>{row['Reflected Power']}</TableCell>
+                        <TableCell>{row.VSWR}</TableCell>
+                        <TableCell>{row['Return Loss']}</TableCell>
+                        <TableCell>{row.Temperature}</TableCell>
+                        <TableCell>{row.Voltage}</TableCell>
+                        <TableCell>{row.Current}</TableCell>
+                        <TableCell>{row.Power}</TableCell>
+                      </TableRow>
+                    ))}
                   </TableBody>
                 </Table>
-                <TablePagination
-                  rowsPerPageOptions={[5, 10, 25]}
-                  component="div"
-                  count={data.length}
-                  rowsPerPage={rowsPerPage}
-                  page={page}
-                  onPageChange={handleChangePage}
-                  onRowsPerPageChange={handleChangeRowsPerPage}
-                />
               </TableContainer>
+              <TablePagination
+                rowsPerPageOptions={[5, 10, 25]}
+                component="div"
+                count={data ? data.length : 0}
+                rowsPerPage={rowsPerPage}
+                page={page}
+                onPageChange={handleChangePage}
+                onRowsPerPageChange={handleChangeRowsPerPage}
+              />
             </TabPanel>
           </TabContext>
 
@@ -459,16 +679,12 @@ const App = () => {
             </Typography>
             <ReportEditor
               groupedStations={{
-                [selectedStation]: selectedBaseStation ? [selectedBaseStation] : baseStations
+                [selectedStation]: baseStations.length > 0 ? baseStations : [selectedStation]
               }}
               stationData={{
-                [selectedBaseStation]: data.map(d => ({
-                  timestamp: d.Timestamp,
-                  latency: d.Voltage,  // Using Voltage as latency
-                  packet_loss: d.Current,  // Using Current as packet loss
-                  signal_strength: d.Power,  // Using Power as signal strength
-                  throughput: d.Power  // Using Power as throughput for now
-                }))
+                [selectedStation]: data ? {
+                  [selectedBaseStation || selectedStation]: data
+                } : {}
               }}
               chartRefs={chartRefs.current}
             />
