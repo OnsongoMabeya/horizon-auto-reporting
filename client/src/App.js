@@ -422,10 +422,6 @@ const App = () => {
 
   useEffect(() => {
     fetchData();
-  }, [fetchData]);
-
-  useEffect(() => {
-    fetchData();
   }, [fetchData, selectedStation, selectedBaseStation, selectedTimePeriod]);
 
   useEffect(() => {
