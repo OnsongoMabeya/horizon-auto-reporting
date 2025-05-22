@@ -336,6 +336,8 @@ const App = () => {
   const [selectedStation, setSelectedStation] = useState(NODE_NAMES[0]);
   const [selectedBaseStation, setSelectedBaseStation] = useState('');
   const [selectedTimePeriod, setSelectedTimePeriod] = useState('24h');
+  const [customStartDate, setCustomStartDate] = useState('');
+  const [customEndDate, setCustomEndDate] = useState('');
   const [baseStations, setBaseStations] = useState([]);
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -424,31 +426,67 @@ const App = () => {
         throw new Error('No station selected');
       }
 
-      const url = `${API_BASE_URL}/api/data/${selectedStation}/${selectedTimePeriod}${selectedBaseStation ? `?baseStation=${encodeURIComponent(selectedBaseStation)}` : ''}`;
+      let url = `${API_BASE_URL}/api/data/${encodeURIComponent(selectedStation)}/${selectedTimePeriod}`;
+      const params = new URLSearchParams();
       
-      const response = await axios.get(url);
-      const newData = response.data;
+      if (selectedBaseStation) {
+        params.append('baseStation', selectedBaseStation);
+      }
       
-      // Calculate global time range from the new data
-      if (newData && newData.length > 0) {
-        // Sort data by timestamp first
-        newData.sort((a, b) => new Date(a.Timestamp) - new Date(b.Timestamp));
+      if (selectedTimePeriod === 'custom' && customStartDate && customEndDate) {
+        console.log('Sending custom date range:', { customStartDate, customEndDate });
+        params.append('startDate', customStartDate);
+        params.append('endDate', customEndDate);
+      }
+      
+      if (params.toString()) {
+        url += `?${params.toString()}`;
+      }
+      
+      console.log('Requesting URL:', url);
+      console.log('Selected time period:', selectedTimePeriod);
+      console.log('Selected base station:', selectedBaseStation);
+      
+      try {
+        const response = await axios.get(url);
+        const newData = response.data;
         
-        // Filter out invalid timestamps and get min/max
-        const validData = newData.filter(d => d && d.Timestamp);
-        if (validData.length > 0) {
-          const min = new Date(validData[0].Timestamp);
-          const max = new Date(validData[validData.length - 1].Timestamp);
+        // Calculate global time range from the new data
+        if (newData && newData.length > 0) {
+          // Sort data by timestamp first
+          newData.sort((a, b) => new Date(a.Timestamp) - new Date(b.Timestamp));
           
-          console.log('New time range:', { min, max });
-          setTimeRange({ min, max });
+          // Filter out invalid timestamps and get min/max
+          const validData = newData.filter(d => d && d.Timestamp);
+          if (validData.length > 0) {
+            const min = new Date(validData[0].Timestamp);
+            const max = new Date(validData[validData.length - 1].Timestamp);
+            
+            console.log('New time range:', { min, max });
+            setTimeRange({ min, max });
+          }
+        }
+
+        setData(newData);
+      } catch (err) {
+        if (err.response && err.response.status === 404) {
+          const details = err.response.data?.details;
+          if (details && details.latestDataPoint) {
+            setError(`No data available in the selected time period. Latest data point: ${new Date(details.latestDataPoint).toLocaleString()}`);
+          } else {
+            setError('No data available for the selected time period.');
+          }
+          setData([]);
+          setTimeRange(null);
+        } else {
+          throw err; // Re-throw other errors
         }
       }
-
-      setData(newData);
     } catch (err) {
       setError('Failed to fetch data. Please try again later.');
       console.error('Error fetching data:', err);
+      setData([]);
+      setTimeRange(null);
     } finally {
       setLoading(false);
     }
@@ -560,16 +598,49 @@ const App = () => {
               </FormControl>
             </Grid>
             <Grid item xs={12}>
-              <FormControl fullWidth>
+              <FormControl sx={{ minWidth: 120, marginRight: 2 }}>
                 <InputLabel>Time Period</InputLabel>
-                <Select value={selectedTimePeriod} onChange={handleTimePeriodChange}>
-                  {TIME_PERIODS.map((period) => (
-                    <MenuItem key={period.value} value={period.value}>
-                      {period.label}
-                    </MenuItem>
-                  ))}
+                <Select
+                  value={selectedTimePeriod}
+                  label="Time Period"
+                  onChange={(e) => {
+                    setSelectedTimePeriod(e.target.value);
+                    if (e.target.value === 'custom') {
+                      // Set default date range to February data
+                      setCustomStartDate('2025-02-03');
+                      setCustomEndDate('2025-03-04');
+                    }
+                  }}
+                >
+                  <MenuItem value="24h">Last 24 Hours</MenuItem>
+                  <MenuItem value="7d">Last 7 Days</MenuItem>
+                  <MenuItem value="30d">Last 30 Days</MenuItem>
+                  <MenuItem value="custom">Custom Range</MenuItem>
                 </Select>
               </FormControl>
+
+              {selectedTimePeriod === 'custom' && (
+                <>
+                  <FormControl sx={{ minWidth: 200, marginRight: 2 }}>
+                    <TextField
+                      label="Start Date"
+                      type="date"
+                      value={customStartDate}
+                      onChange={(e) => setCustomStartDate(e.target.value)}
+                      InputLabelProps={{ shrink: true }}
+                    />
+                  </FormControl>
+                  <FormControl sx={{ minWidth: 200, marginRight: 2 }}>
+                    <TextField
+                      label="End Date"
+                      type="date"
+                      value={customEndDate}
+                      onChange={(e) => setCustomEndDate(e.target.value)}
+                      InputLabelProps={{ shrink: true }}
+                    />
+                  </FormControl>
+                </>
+              )}
             </Grid>
           </Grid>
 

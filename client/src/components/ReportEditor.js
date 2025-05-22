@@ -163,8 +163,12 @@ const ReportEditor = ({ groupedStations, stationData }) => {
 
     try {
       const data = processedData[station];
-      if (!data) {
-        throw new Error(`No processed data available for station: ${station}`);
+      if (!data || !data.timestamps || data.timestamps.length === 0) {
+        setNarrations(prev => ({
+          ...prev,
+          [station]: `No data available for ${station} in the selected time period.`
+        }));
+        return;
       }
 
       // Calculate insights

@@ -12,8 +12,9 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// Use port 5000 for the web server, 3306 is for MySQL
+// Use port 5000 for the web server
 const serverPort = process.env.SERVER_PORT || 5000;
+const dbPort = process.env.DB_PORT || 3306;  // Separate port for MySQL
 let db;
 
 // Health check endpoint
@@ -21,57 +22,65 @@ app.get('/api/health', (req, res) => {
   res.status(200).json({ status: 'ok', dbConnected: !!db });
 });
 
-// Initialize MySQL connection pool
-async function initializeDB() {
-  try {
-    const config = {
-      host: process.env.DB_HOST || 'localhost',
-      user: process.env.DB_USER || 'john',
-      password: process.env.DB_PASSWORD || 'password',
-      database: process.env.DB_NAME || 'horiserverlive',
-      port: process.env.DB_PORT || 3306,
-      waitForConnections: true,
-      connectionLimit: 10,
-      queueLimit: 0
-    };
+// Initialize MySQL connection pool with retries
+async function initializeDB(retries = 3, delay = 5000) {
+  if (db) {
+    return db;
+  }
 
-    console.log('Initializing database with config:', {
-      ...config,
-      password: '****' // Don't log the password
-    });
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      console.log(`Attempting to connect to database (attempt ${attempt}/${retries})...`);
+      
+      db = await mysql.createPool({
+        host: process.env.DB_HOST || 'localhost',
+        port: dbPort,  // Use separate port for MySQL
+        user: process.env.DB_USER || 'john',
+        password: process.env.DB_PASSWORD || 'password',
+        database: process.env.DB_NAME || 'horiserverlive',
+        waitForConnections: true,
+        connectionLimit: 10,
+        queueLimit: 0,
+        connectTimeout: 20000, // 20 second timeout
+        acquireTimeout: 20000,
+        enableKeepAlive: true,
+        keepAliveInitialDelay: 10000
+      });
 
-    // Create the connection pool
-    db = await mysql.createPool(config);
-    
-    // Test connection and check database/tables
-    const [tables] = await db.query('SHOW TABLES');
-    console.log('Successfully connected to MySQL database');
-    console.log('Available tables:', tables);
+      // Test the connection
+      const connection = await db.getConnection();
+      console.log('Successfully connected to MySQL database');
 
-    // Verify required tables exist
-    const requiredTables = ['node_status_table'];
-    const existingTables = tables.map(row => Object.values(row)[0]);
-    
-    for (const table of requiredTables) {
-      if (!existingTables.includes(table)) {
-        throw new Error(`Required table '${table}' not found in database`);
+      try {
+        // Verify database access
+        const [rowCount] = await connection.query('SELECT COUNT(*) as count FROM node_status_table');
+        console.log(`Database has ${rowCount[0].count} records`);
+
+        // Cache initial data
+        const [nodes] = await connection.query('SELECT DISTINCT NodeName FROM node_status_table');
+        console.log('Available nodes:', nodes.map(node => node.NodeName));
+
+        const [baseStations] = await connection.query('SELECT DISTINCT NodeBaseStationName FROM node_status_table');
+        console.log('Available base stations:', baseStations.map(station => station.NodeBaseStationName));
+
+        return db;
+      } catch (queryError) {
+        console.error('Error querying database:', queryError);
+        throw queryError;
+      } finally {
+        connection.release();
       }
+    } catch (error) {
+      console.error(`Database connection attempt ${attempt} failed:`, error);
+      
+      if (attempt === retries) {
+        console.error('All database connection attempts failed');
+        throw error;
+      }
+      
+      console.log(`Waiting ${delay/1000} seconds before retrying...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
     }
-
-    // Test query on node_status_table
-    const [testRow] = await db.query('SELECT COUNT(*) as count FROM node_status_table');
-    console.log('node_status_table row count:', testRow[0].count);
-  } catch (err) {
-    console.error('Error initializing database:', err);
-    console.error('Database connection failed. Please check your configuration.');
-    console.error('Environment variables:', {
-      DB_HOST: process.env.DB_HOST,
-      DB_USER: process.env.DB_USER,
-      DB_NAME: process.env.DB_NAME,
-      DB_PORT: process.env.DB_PORT
-    });
-    db = null; // Reset db connection if it failed
-    process.exit(1);
   }
 }
 
@@ -301,67 +310,107 @@ function getOverallAssessment(stats) {
 
 app.get('/api/data/:nodeName/:timePeriod', async (req, res) => {
   const { nodeName, timePeriod } = req.params;
-  const { baseStation } = req.query;
-  console.log('\n[/api/data] Request:', { nodeName, baseStation, timePeriod });
+  const { baseStation, startDate, endDate } = req.query;
+  console.log('\n[/api/data] Request:', { nodeName, baseStation, timePeriod, startDate, endDate });
   
   try {
     if (!db) {
       console.error('Database connection not initialized');
       return res.status(500).json({ error: 'Database connection not available' });
     }
+
     console.log('Database connection status:', !!db);
 
     // First verify the node exists
     const [nodeCheck] = await db.query('SELECT DISTINCT NodeName FROM node_status_table WHERE NodeName = ?', [nodeName]);
+
     if (nodeCheck.length === 0) {
       return res.status(404).json({ error: `Node '${nodeName}' not found` });
     }
 
-    // If baseStation is specified, verify it exists for this node
+    // Calculate start time based on time period
+    const now = new Date();
+    let startTime;
+    let endTime;
+
+    if (timePeriod === 'custom' && startDate && endDate) {
+      console.log('Custom date range:', { startDate, endDate });
+      startTime = new Date(startDate);
+      endTime = new Date(endDate);
+      // Set end time to end of day
+      endTime.setHours(23, 59, 59, 999);
+
+      if (isNaN(startTime.getTime()) || isNaN(endTime.getTime())) {
+        return res.status(400).json({ error: 'Invalid date format' });
+      }
+
+      if (endTime < startTime) {
+        return res.status(400).json({ error: 'End date must be after start date' });
+      }
+
+      console.log('Parsed dates:', {
+        startTime: startTime.toISOString(),
+        endTime: endTime.toISOString()
+      });
+    } else {
+      switch (timePeriod) {
+        case '24h':
+          startTime = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+          break;
+        case '7d':
+          startTime = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+          break;
+        case '30d':
+          startTime = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+          break;
+        default:
+          return res.status(400).json({ error: 'Invalid time period' });
+      }
+      endTime = now;
+    }
+
+    // Then verify the base station exists for this node
     if (baseStation) {
-      const [baseStationCheck] = await db.query(
-        'SELECT DISTINCT NodeBaseStationName FROM node_status_table WHERE NodeName = ? AND NodeBaseStationName = ?',
-        [nodeName, baseStation]
-      );
+      const [baseStationCheck] = await db.query('SELECT DISTINCT NodeBaseStationName FROM node_status_table WHERE NodeName = ? AND NodeBaseStationName = ?', [nodeName, baseStation]);
+
       if (baseStationCheck.length === 0) {
-        return res.status(404).json({ error: `Base station '${baseStation}' not found for node '${nodeName}'` });
+        return res.status(404).json({
+          error: `Base station '${baseStation}' not found for node '${nodeName}'`
+        });
       }
     }
 
-    // Calculate time filter based on period
-    let timeFilter;
-    const now = new Date();
-    
-    switch (timePeriod) {
-      case '1h':
-        timeFilter = new Date(now - 60 * 60 * 1000);
-        break;
-      case '24h':
-        timeFilter = new Date(now - 24 * 60 * 60 * 1000);
-        break;
-      case '7d':
-        timeFilter = new Date(now - 7 * 24 * 60 * 60 * 1000);
-        break;
-      case '30d':
-        timeFilter = new Date(now - 30 * 24 * 60 * 60 * 1000);
-        break;
-      default:
-        return res.status(400).json({
-          error: 'Invalid time period. Must be one of: 1h, 24h, 7d, 30d'
-        });
+    // First check if there's any data in the requested time period
+    const [timeCheck] = await db.query(
+      'SELECT MAX(time) as latest, MIN(time) as earliest FROM node_status_table WHERE NodeName = ?',
+      [nodeName]
+    );
+
+    if (!timeCheck[0].latest) {
+      return res.status(404).json({
+        error: `No data found for node '${nodeName}'`,
+        details: 'Node exists but has no data'
+      });
     }
 
-    timeFilter = timeFilter.toISOString().slice(0, 19).replace('T', ' ');
-    console.log('Time filter:', timeFilter);
+    // Check if the requested time period has any data
+    const [periodCheck] = await db.query(
+      'SELECT COUNT(*) as count FROM node_status_table WHERE NodeName = ? AND time >= ?',
+      [nodeName, startTime]
+    );
 
-    const params = [nodeName];
-    let baseStationFilter = '';
-    
-    if (baseStation) {
-      baseStationFilter = ' AND NodeBaseStationName = ?';
-      params.push(baseStation);
+    if (periodCheck[0].count === 0) {
+      return res.status(404).json({
+        error: `No data found for node '${nodeName}' in the last ${timePeriod}`,
+        details: {
+          requestedPeriod: timePeriod,
+          latestDataPoint: timeCheck[0].latest,
+          earliestDataPoint: timeCheck[0].earliest
+        }
+      });
     }
 
+    // Get data for the specified time period
     const query = `
       SELECT 
         NodeName,
@@ -389,18 +438,20 @@ app.get('/api/data/:nodeName/:timePeriod', async (req, res) => {
         , 2) as 'Return Loss'
       FROM node_status_table
       WHERE NodeName = ?
-      ${baseStationFilter}
-      AND time >= ?
+      AND DATE(time) >= DATE(?)
+      AND DATE(time) <= DATE(?)
+      ${baseStation ? 'AND NodeBaseStationName = ?' : ''}
       ORDER BY time DESC
     `;
 
     console.log('Query:', query);
+    const queryParams = [nodeName, startTime, endTime, baseStation].filter(param => param !== undefined);
+    console.log('Query params:', queryParams);
+    console.log('Time range:', { startTime, endTime });
 
-    console.log('\nData query:', query);
-    console.log('Query params:', params);
-    console.log('Time filter:', timeFilter);
-
-    const [rows] = await db.query(query, params);
+    // Execute the query
+    const [rows] = await db.query(query, queryParams);
+    console.log(`Found ${rows.length} rows`);
     
     if (rows.length === 0) {
       return res.status(404).json({
@@ -443,20 +494,12 @@ app.get('/api/base-stations/:nodeName', async (req, res) => {
     }
 
     // Get base stations for this node
-    const [rows] = await db.query(
+    const [baseStations] = await db.query(
       'SELECT DISTINCT NodeBaseStationName FROM node_status_table WHERE NodeName = ? ORDER BY NodeBaseStationName',
       [nodeName]
     );
 
-    if (rows.length === 0) {
-      return res.status(404).json({
-        error: `No base stations found for node '${nodeName}'`
-      });
-    }
-
-    const baseStations = rows.map(row => row.NodeBaseStationName);
-    console.log('Found base stations:', baseStations);
-    res.json(baseStations);
+    res.json(baseStations.map(row => row.NodeBaseStationName));
   } catch (err) {
     console.error('Error fetching base stations:', err);
     res.status(500).json({ error: 'Failed to fetch base stations' });
@@ -473,34 +516,29 @@ app.use((err, req, res, next) => {
 });
 
 // Start server with error handling and port conflict resolution
-async function startServer() {
+async function startServer(port = serverPort) {
   try {
-    await initializeDB();
-    
-    // Try to start the server
-    const server = app.listen(serverPort)
-      .on('error', async (error) => {
-        if (error.code === 'EADDRINUSE') {
-          console.log(`Port ${serverPort} is busy, trying port ${serverPort + 1}`);
-          // Try the next port
-          const nextServer = app.listen(serverPort + 1)
-            .on('error', (err) => {
-              console.error('Failed to start server on alternate port:', err);
-              process.exit(1);
-            })
-            .on('listening', () => {
-              console.log(`Server running on alternate port ${serverPort + 1}`);
-            });
+    // Initialize database with retries before starting server
+    await initializeDB(3, 5000);
+
+    return new Promise((resolve, reject) => {
+      const server = app.listen(port, () => {
+        console.log(`Server running on port ${port}`);
+        resolve(server);
+      }).on('error', (err) => {
+        if (err.code === 'EADDRINUSE') {
+          console.log(`Port ${port} is busy, trying ${port + 1}`);
+          resolve(startServer(port + 1));
         } else {
-          console.error('Failed to start server:', error);
-          process.exit(1);
+          reject(err);
         }
-      })
-      .on('listening', () => {
-        console.log(`Server running on port ${serverPort}`);
       });
+    });
   } catch (error) {
     console.error('Failed to start server:', error);
+    if (error.code === 'ETIMEDOUT') {
+      console.error('Database connection timed out. Please check that MySQL is running and accessible.');
+    }
     process.exit(1);
   }
 }
